@@ -1,21 +1,17 @@
 import os
 import sys
-import re
 import html
-from datetime import datetime, timedelta, timezone
 import requests
+from datetime import datetime, timezone, timedelta
 from google import genai
 
-# 환경변수 로드
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "").strip()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 def check_env():
     missing = [k for k, v in [
         ("GEMINI_API_KEY", GEMINI_API_KEY),
-        ("YOUTUBE_API_KEY", YOUTUBE_API_KEY),
         ("TELEGRAM_BOT_TOKEN", TELEGRAM_BOT_TOKEN),
         ("TELEGRAM_CHAT_ID", TELEGRAM_CHAT_ID)
     ] if not v]
@@ -23,153 +19,95 @@ def check_env():
         print(f"[오류] 누락된 Secrets: {', '.join(missing)}")
         sys.exit(1)
 
-def has_korean(text):
-    """한글 포함 여부 판별 (해외 데이터 오염 방지)"""
-    return bool(re.search(r'[가-힣]', text))
-
-def search_youtube_ai_shorts(query, region_code, is_korean_target, days=4, top_n=3):
-    """
-    순수 AI 관련 숏폼 영상만 엄격하게 수집 및 국가 언어 필터링
-    """
-    published_after = (datetime.now(timezone.utc) - timedelta(days=days)).strftime('%Y-%m-%dT%H:%M:%SZ')
-    search_url = "https://www.googleapis.com/youtube/v3/search"
-    search_params = {
-        "part": "id,snippet",
-        "q": query,
-        "type": "video",
-        "videoDuration": "short",
-        "order": "viewCount",
-        "publishedAfter": published_after,
-        "regionCode": region_code,
-        "maxResults": 25,
-        "key": YOUTUBE_API_KEY
-    }
+def fetch_top_ai_videos(limit=10):
+    """r/aivideo에서 당일 추천수(Upvote) 기준 상위 10개 영상 추출"""
+    headers = {"User-Agent": "python:aivideo.trend.notifier:v1.0 (by /u/DailyTrendBot)"}
     
-    s_res = requests.get(search_url, params=search_params)
-    if s_res.status_code != 200:
-        return []
-
-    items = s_res.json().get("items", [])
-    candidate_ids = []
+    # 1차 시도: 오늘(24시간) 최고 인기 게시물
+    url = "https://www.reddit.com/r/aivideo/top.json?t=day&limit=25"
+    res = requests.get(url, headers=headers, timeout=10)
     
-    for item in items:
-        vid = item.get("id", {}).get("videoId")
-        title = item.get("snippet", {}).get("title", "")
-        if not vid:
+    posts = []
+    if res.status_code == 200:
+        posts = res.json().get("data", {}).get("children", [])
+    
+    # 만약 오늘 게시물이 10개 미만이면 이번 주(week) 인기 게시물로 보충
+    if len(posts) < limit:
+        url_week = "https://www.reddit.com/r/aivideo/top.json?t=week&limit=25"
+        res_week = requests.get(url_week, headers=headers, timeout=10)
+        if res_week.status_code == 200:
+            posts = res_week.json().get("data", {}).get("children", [])
+
+    results = []
+    for p in posts:
+        d = p.get("data", {})
+        # 공지(Sticky) 제외
+        if d.get("stickied"):
             continue
             
-        # 언어 필터링: 국내용은 한글 필수, 해외용은 한글 단 1글자도 불허
-        is_kor = has_korean(title)
-        if is_korean_target and not is_kor:
-            continue
-        if not is_korean_target and is_kor:
-            continue
-            
-        candidate_ids.append(vid)
+        title = d.get("title", "").strip()
+        score = d.get("score", 0)
+        comments = d.get("num_comments", 0)
+        flair = d.get("link_flair_text") or "AI Video"
+        permalink = f"https://www.reddit.com{d.get('permalink')}"
+        video_url = d.get("url_overridden_by_dest") or permalink
 
-    if not candidate_ids:
-        return []
-
-    # 실제 조회수 검증
-    v_url = "https://www.googleapis.com/youtube/v3/videos"
-    v_params = {
-        "part": "snippet,statistics",
-        "id": ",".join(candidate_ids[:15]),
-        "key": YOUTUBE_API_KEY
-    }
-    v_res = requests.get(v_url, params=v_params)
-    if v_res.status_code != 200:
-        return []
-
-    v_items = v_res.json().get("items", [])
-    
-    verified_list = []
-    for v in v_items:
-        vid = v["id"]
-        title = v["snippet"]["title"].replace("\n", " ").strip()
-        channel = v["snippet"]["channelTitle"]
-        views = int(v.get("statistics", {}).get("viewCount", 0))
-        pub_date = v["snippet"]["publishedAt"][:10]
-        
-        verified_list.append({
+        results.append({
             "title": title,
-            "channel": channel,
-            "views": views,
-            "pub_date": pub_date,
-            "url": f"https://www.youtube.com/shorts/{vid}"
+            "score": score,
+            "comments": comments,
+            "tool_flair": flair.strip(),
+            "link": video_url,
+            "reddit_link": permalink
         })
+        
+        if len(results) >= limit:
+            break
 
-    # 실제 조회수 기준 내림차순 정렬 후 상위 top_n개 반환
-    verified_list.sort(key=lambda x: x["views"], reverse=True)
-    return verified_list[:top_n]
+    return results
 
-def analyze_ai_insights(kr_list, global_list, reels_list):
-    """수집된 AI 영상들만을 바탕으로 시각 연출 및 툴 분석"""
+def analyze_ai_trends(video_list):
+    """Gemini를 통한 시각 연출 및 기획 포인트 분석"""
     client = genai.Client(api_key=GEMINI_API_KEY)
     
-    all_titles = [f"- {v['title']}" for v in (kr_list + global_list + reels_list)]
-    context = "\n".join(all_titles)
+    summary_context = "\n".join([
+        f"- 제목: {v['title']} (사용한 툴/태그: {v['tool_flair']})"
+        for v in video_list
+    ])
 
     prompt = f"""
-다음은 최근 3~4일간 유튜브, 틱톡, 릴스에서 급상승한 '순수 AI 생성 숏폼 영상'들의 실제 제목 목록이다:
-{context}
+다음은 오늘 글로벌 1위 AI 영상 커뮤니티(r/aivideo)에서 추천수 1위부터 10위를 기록한 실제 신작 목록이다:
+{summary_context}
 
-너는 전문 AI 영상 크리에이터다. 위 영상들의 제목과 콘셉트를 기반으로 다음 2가지를 명확하게 분석해라:
-1. 🎨 시각 연출 트렌드 및 추정 AI 툴 조합: (현재 바이럴되는 질감, 카메라 무빙, 캐릭터/상황극 포맷 및 추정되는 AI 툴 조합 - 예: Midjourney + Kling/Luma/Runway 등)
-2. 💡 블루오션 숏폼 기획 제안: (기존 클리셰를 탈피해 오늘 바로 시도해볼 수 있는 신선한 AI 숏폼 아이디어 1줄)
+숏폼 전문 크리에이터의 관점에서 다음 두 가지를 간결하고 실질적으로 작성해라:
+1. 🎨 오늘의 지배적인 비주얼 스타일 & AI 툴 트렌드 (1~2줄)
+2. 💡 당장 벤치마킹할 만한 숏폼 기획 아이디어 (1줄)
 
-※ 주의: 뜬구름 잡는 일반론("반전이 중요합니다" 등)은 절대 금지하며, AI 영상 제작 워크플로우 관점에서 실질적으로 작성해라.
+(마크다운 특수문자 볼드나 따옴표 없이 깔끔한 일반 텍스트로만 작성)
 """
-    for model_name in ["gemini-3.8-flash", "gemini-3.5-flash-lite"]:
+    for model_name in ["gemini-2.5-flash", "gemini-1.5-flash"]:
         try:
             res = client.models.generate_content(model=model_name, contents=prompt)
             if res and res.text:
                 return res.text.strip()
         except Exception:
             continue
-    return "AI 캐릭터의 물리 법칙을 비튼 시각적 이질감과 스톱모션 질감이 높은 완청률을 견인하고 있습니다."
+    return "물리 법칙을 비튼 초현실적 상황극과 정교한 텍스처 표현이 높은 반응을 얻고 있습니다."
 
-def build_telegram_html(kr_ai, global_ai, reels_ai, insights):
+def build_message(video_list, insights):
     today = datetime.now(timezone(timedelta(hours=9))).strftime('%Y-%m-%d')
-    lines = [f"🤖 <b>[AI 숏폼 트렌드 데일리 리포트]</b> - {today}\n"]
+    lines = [f"🤖 <b>[글로벌 검증 순수 AI 숏폼 TOP 10]</b> - {today}\n"]
+    
+    for idx, v in enumerate(video_list, 1):
+        clean_title = html.escape(v['title'])
+        clean_flair = html.escape(v['tool_flair'])
+        lines.append(f"<b>{idx}. {clean_title}</b>")
+        lines.append(f"   • 추천: 👍 {v['score']:,}개 | 댓글: 💬 {v['comments']:,}개")
+        lines.append(f"   • 제작 툴/태그: <code>{clean_flair}</code>")
+        lines.append(f"   👉 <a href=\"{v['link']}\"><b>[영상 바로보기]</b></a>\n")
 
-    # 1. 국내 순수 AI 쇼츠
-    lines.append("🇰🇷 <b>1. 국내 급상승 AI 숏폼 TOP 3</b>")
-    if kr_ai:
-        for idx, v in enumerate(kr_ai, 1):
-            clean_title = html.escape(v['title'])
-            lines.append(f"{idx}. {clean_title}")
-            lines.append(f"   • 조회수: {v['views']:,}회 | 채널: {html.escape(v['channel'])}")
-            lines.append(f"   👉 <a href=\"{v['url']}\"><b>[영상 바로보기]</b></a>\n")
-    else:
-        lines.append("   (최근 72시간 내 기준 충족 영상 집계 중)\n")
-
-    # 2. 해외 순수 AI 쇼츠 (한글 0% 보장)
-    lines.append("🌍 <b>2. 해외 급상승 AI 숏폼 TOP 3</b>")
-    if global_ai:
-        for idx, v in enumerate(global_ai, 1):
-            clean_title = html.escape(v['title'])
-            lines.append(f"{idx}. {clean_title}")
-            lines.append(f"   • 조회수: {v['views']:,}회 | 채널: {html.escape(v['channel'])}")
-            lines.append(f"   👉 <a href=\"{v['url']}\"><b>[영상 바로보기]</b></a>\n")
-    else:
-        lines.append("   (최근 72시간 내 기준 충족 영상 집계 중)\n")
-
-    # 3. 틱톡/릴스 유행 AI 챌린지 및 바이럴 포맷
-    lines.append("🔥 <b>3. 틱톡 & 릴스 유행 AI 바이럴 TOP 3</b>")
-    if reels_ai:
-        for idx, v in enumerate(reels_ai, 1):
-            clean_title = html.escape(v['title'])
-            lines.append(f"{idx}. {clean_title}")
-            lines.append(f"   • 조회수: {v['views']:,}회 | 채널: {html.escape(v['channel'])}")
-            lines.append(f"   👉 <a href=\"{v['url']}\"><b>[영상 바로보기]</b></a>\n")
-    else:
-        lines.append("   (최근 72시간 내 기준 충족 영상 집계 중)\n")
-
-    # 4. AI 워크플로우 인사이트
-    lines.append("💡 <b>4. AI 연출 분석 및 제작 기획 제안</b>")
+    lines.append("💡 <b>오늘의 AI 연출 분석 & 기획 팁</b>")
     lines.append(html.escape(insights))
-
     return "\n".join(lines)
 
 def send_telegram(html_text):
@@ -182,44 +120,22 @@ def send_telegram(html_text):
     }
     res = requests.post(url, json=payload)
     if res.status_code != 200:
-        print(f"[전송 오류] {res.text}")
+        print(f"[전송 에러] {res.text}")
         sys.exit(1)
 
 if __name__ == "__main__":
     check_env()
-    print("1. 국내/해외/릴스 순수 AI 숏폼 데이터 필터링 수집 중...")
+    print("1. r/aivideo 실시간 랭킹 TOP 10 수집 중...")
+    top_videos = fetch_top_ai_videos(limit=10)
     
-    # 1) 국내 AI 숏폼 전용 쿼리
-    kr_ai = search_youtube_ai_shorts(
-        query='"AI" ("애니" OR "쇼츠" OR "영상" OR "만들기" OR "툰") #shorts',
-        region_code="KR",
-        is_korean_target=True,
-        days=4,
-        top_n=3
-    )
-    
-    # 2) 해외 AI 숏폼 전용 쿼리 (영어 전용, 한글 원천 차단)
-    global_ai = search_youtube_ai_shorts(
-        query='("AI animation" OR "AI shorts" OR "AI generated" OR "AI film") -#쇼츠',
-        region_code="US",
-        is_korean_target=False,
-        days=4,
-        top_n=3
-    )
-    
-    # 3) 인스타 릴스 / 틱톡에서 넘어온 바이럴 AI 트렌드 전용 쿼리
-    reels_ai = search_youtube_ai_shorts(
-        query='("AI reels trend" OR "AI tiktok trend" OR "AI viral" OR "AI meme trend")',
-        region_code="US",
-        is_korean_target=False,
-        days=5,
-        top_n=3
-    )
+    if not top_videos:
+        print("[경고] 수집된 영상이 없습니다.")
+        sys.exit(1)
 
-    print("2. AI 워크플로우 및 연출 분석 생성 중...")
-    insights = analyze_ai_insights(kr_ai, global_ai, reels_ai)
+    print("2. Gemini 트렌드 요약 분석 중...")
+    insights = analyze_ai_trends(top_videos)
 
-    print("3. HTML 하이퍼링크 메시지 조립 및 전송...")
-    message = build_telegram_html(kr_ai, global_ai, reels_ai, insights)
-    send_telegram(message)
-    print("전송 완료!")
+    print("3. 텔레그램 메시지 생성 및 전송...")
+    msg = build_message(top_videos, insights)
+    send_telegram(msg)
+    print("성공적으로 발송되었습니다!")
