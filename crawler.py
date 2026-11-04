@@ -1,10 +1,10 @@
 import os
 import sys
-import html
 import requests
 from datetime import datetime, timezone, timedelta
 from google import genai
 
+# 환경변수 로드
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -19,123 +19,111 @@ def check_env():
         print(f"[오류] 누락된 Secrets: {', '.join(missing)}")
         sys.exit(1)
 
-def fetch_top_ai_videos(limit=10):
-    """r/aivideo에서 당일 추천수(Upvote) 기준 상위 10개 영상 추출"""
-    headers = {"User-Agent": "python:aivideo.trend.notifier:v1.0 (by /u/DailyTrendBot)"}
+def fetch_reddit_aivideo_content():
+    """Jina Reader를 경유하여 레딧의 클라우드 IP 차단을 우회하고 실시간 인기 AI 영상 데이터 수집"""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        "X-No-Cache": "true"
+    }
     
-    # 1차 시도: 오늘(24시간) 최고 인기 게시물
-    url = "https://www.reddit.com/r/aivideo/top.json?t=day&limit=25"
-    res = requests.get(url, headers=headers, timeout=10)
-    
-    posts = []
-    if res.status_code == 200:
-        posts = res.json().get("data", {}).get("children", [])
-    
-    # 만약 오늘 게시물이 10개 미만이면 이번 주(week) 인기 게시물로 보충
-    if len(posts) < limit:
-        url_week = "https://www.reddit.com/r/aivideo/top.json?t=week&limit=25"
-        res_week = requests.get(url_week, headers=headers, timeout=10)
-        if res_week.status_code == 200:
-            posts = res_week.json().get("data", {}).get("children", [])
+    # 1차 시도: 오늘(Day) 기준 최고 인기 AI 영상
+    url_day = "https://r.jina.ai/https://www.reddit.com/r/aivideo/top/?t=day"
+    try:
+        res = requests.get(url_day, headers=headers, timeout=25)
+        if res.status_code == 200 and len(res.text) > 600:
+            print(f"[성공] r/aivideo 일간 데이터 수집 완료 ({len(res.text)} bytes)")
+            return res.text
+    except Exception as e:
+        print(f"[안내] 일간 데이터 요청 예외: {e}")
 
-    results = []
-    for p in posts:
-        d = p.get("data", {})
-        # 공지(Sticky) 제외
-        if d.get("stickied"):
-            continue
-            
-        title = d.get("title", "").strip()
-        score = d.get("score", 0)
-        comments = d.get("num_comments", 0)
-        flair = d.get("link_flair_text") or "AI Video"
-        permalink = f"https://www.reddit.com{d.get('permalink')}"
-        video_url = d.get("url_overridden_by_dest") or permalink
+    # 2차 시도: 게시물이 적을 경우 주간(Week) 기준 보충
+    url_week = "https://r.jina.ai/https://www.reddit.com/r/aivideo/top/?t=week"
+    try:
+        res = requests.get(url_week, headers=headers, timeout=25)
+        if res.status_code == 200 and len(res.text) > 600:
+            print(f"[성공] r/aivideo 주간 데이터 수집 완료 ({len(res.text)} bytes)")
+            return res.text
+    except Exception as e:
+        print(f"[오류] 주간 데이터 요청 예외: {e}")
 
-        results.append({
-            "title": title,
-            "score": score,
-            "comments": comments,
-            "tool_flair": flair.strip(),
-            "link": video_url,
-            "reddit_link": permalink
-        })
-        
-        if len(results) >= limit:
-            break
+    return None
 
-    return results
-
-def analyze_ai_trends(video_list):
-    """Gemini를 통한 시각 연출 및 기획 포인트 분석"""
+def parse_and_summarize_with_gemini(raw_text):
+    """Gemini를 통해 원문에서 TOP 10 순수 AI 영상 및 실제 링크 추출"""
     client = genai.Client(api_key=GEMINI_API_KEY)
+    today = datetime.now(timezone(timedelta(hours=9))).strftime('%Y-%m-%d')
     
-    summary_context = "\n".join([
-        f"- 제목: {v['title']} (사용한 툴/태그: {v['tool_flair']})"
-        for v in video_list
-    ])
-
     prompt = f"""
-다음은 오늘 글로벌 1위 AI 영상 커뮤니티(r/aivideo)에서 추천수 1위부터 10위를 기록한 실제 신작 목록이다:
-{summary_context}
+오늘은 {today}이다.
+아래 텍스트는 전 세계 1위 순수 AI 영상 커뮤니티인 Reddit r/aivideo에서 방금 실시간 수집한 최신 데이터 원문이다.
+텍스트에 포함된 실제 게시물 데이터만을 기반으로 추천수(Upvotes)가 높은 순수 AI 영상 TOP 10을 추출해라.
 
-숏폼 전문 크리에이터의 관점에서 다음 두 가지를 간결하고 실질적으로 작성해라:
-1. 🎨 오늘의 지배적인 비주얼 스타일 & AI 툴 트렌드 (1~2줄)
-2. 💡 당장 벤치마킹할 만한 숏폼 기획 아이디어 (1줄)
+[원문 데이터]
+{raw_text[:12000]}
 
-(마크다운 특수문자 볼드나 따옴표 없이 깔끔한 일반 텍스트로만 작성)
+[작성 및 출력 양식 - 엄격한 HTML 준수]
+- 텔레그램 전송용이므로 마크다운 볼드(**)나 샵(##)은 절대 쓰지 말고, 오직 <b>, <code>, <a> 태그와 이모지만 사용할 것.
+- 제목: 🤖 <b>[글로벌 검증 순수 AI 숏폼 TOP 10]</b> - {today}
+
+- 1위부터 10위까지 아래 형식으로 작성:
+<b>1. 영상 제목 (필요시 핵심 한국어 요약 병기)</b>
+   • 추천: 👍 숫자개 | 툴/태그: <code>원문에 표기된 AI 툴(Kling, Luma, Runway, Midjourney 등)</code>
+   👉 <a href="원문의 실제 reddit.com 영상 게시물 링크"><b>[영상 바로보기]</b></a>
+
+- 마지막 항목:
+💡 <b>오늘의 AI 연출 분석 & 기획 제안</b>
+(오늘 상위권 AI 영상들의 비주얼 특징과 숏폼 제작에 바로 적용할 수 있는 기획 팁 2줄)
 """
-    for model_name in ["gemini-2.5-flash", "gemini-1.5-flash"]:
+    for model_name in ["gemini-3.8-flash", "gemini-3.5-flash-lite"]:
         try:
             res = client.models.generate_content(model=model_name, contents=prompt)
             if res and res.text:
                 return res.text.strip()
-        except Exception:
-            continue
-    return "물리 법칙을 비튼 초현실적 상황극과 정교한 텍스처 표현이 높은 반응을 얻고 있습니다."
-
-def build_message(video_list, insights):
-    today = datetime.now(timezone(timedelta(hours=9))).strftime('%Y-%m-%d')
-    lines = [f"🤖 <b>[글로벌 검증 순수 AI 숏폼 TOP 10]</b> - {today}\n"]
-    
-    for idx, v in enumerate(video_list, 1):
-        clean_title = html.escape(v['title'])
-        clean_flair = html.escape(v['tool_flair'])
-        lines.append(f"<b>{idx}. {clean_title}</b>")
-        lines.append(f"   • 추천: 👍 {v['score']:,}개 | 댓글: 💬 {v['comments']:,}개")
-        lines.append(f"   • 제작 툴/태그: <code>{clean_flair}</code>")
-        lines.append(f"   👉 <a href=\"{v['link']}\"><b>[영상 바로보기]</b></a>\n")
-
-    lines.append("💡 <b>오늘의 AI 연출 분석 & 기획 팁</b>")
-    lines.append(html.escape(insights))
-    return "\n".join(lines)
+        except Exception as e:
+            print(f"[경고] {model_name} 호출 실패, 대체 모델 시도: {e}")
+            
+    print("[오류] Gemini 분석 실패")
+    sys.exit(1)
 
 def send_telegram(html_text):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": html_text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True
-    }
-    res = requests.post(url, json=payload)
-    if res.status_code != 200:
-        print(f"[전송 에러] {res.text}")
-        sys.exit(1)
+    
+    # 텔레그램 4,000자 제한 안전 분할
+    chunks = []
+    text_to_split = html_text
+    while len(text_to_split) > 3800:
+        split_idx = text_to_split.rfind("\n\n", 0, 3800)
+        if split_idx == -1: split_idx = 3800
+        chunks.append(text_to_split[:split_idx])
+        text_to_split = text_to_split[split_idx:].lstrip("\n")
+    if text_to_split:
+        chunks.append(text_to_split)
+
+    for chunk in chunks:
+        payload = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": chunk,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True
+        }
+        res = requests.post(url, json=payload)
+        if res.status_code != 200:
+            print(f"[전송 에러 (HTTP {res.status_code})]: {res.text}")
+            sys.exit(1)
+            
+    print("[성공] 텔레그램 발송 완료!")
 
 if __name__ == "__main__":
     check_env()
-    print("1. r/aivideo 실시간 랭킹 TOP 10 수집 중...")
-    top_videos = fetch_top_ai_videos(limit=10)
+    print("1. r/aivideo 우회 데이터 수집 중...")
+    content = fetch_reddit_aivideo_content()
     
-    if not top_videos:
-        print("[경고] 수집된 영상이 없습니다.")
+    if not content:
+        print("[오류] 레딧 데이터 수집 실패")
         sys.exit(1)
 
-    print("2. Gemini 트렌드 요약 분석 중...")
-    insights = analyze_ai_trends(top_videos)
+    print("2. Gemini TOP 10 추출 및 분석 중...")
+    report = parse_and_summarize_with_gemini(content)
 
-    print("3. 텔레그램 메시지 생성 및 전송...")
-    msg = build_message(top_videos, insights)
-    send_telegram(msg)
-    print("성공적으로 발송되었습니다!")
+    print("3. 텔레그램 메시지 발송 중...")
+    send_telegram(report)
