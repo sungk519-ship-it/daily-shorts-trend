@@ -1,0 +1,35 @@
+name: Daily Shorts Trend Bot
+
+on:
+  schedule:
+    - cron: '0 23 * * *' # UTC 23:00 = 한국 시간(KST) 매일 오전 08:00 실행
+  workflow_dispatch:     # 수동으로 즉시 실행할 수 있는 테스트 버튼 활성화
+
+permissions:
+  contents: read
+
+jobs:
+  send-trend-report:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests google-genai
+
+      - name: Run Trend Crawler and Send Telegram
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python crawler.py
